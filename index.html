@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html> <!-- The HTML page for the App will have a head, a body, and a script component -->
+<head>
+	<meta charset="UTF-8">
+	<title>Utilization Distribution App - Powered by CA Performance Management OpenAPI </title>
+	<link rel="stylesheet" href="./css/nv.d3.css"></link>  <!-- The NVD3 CSS stylesheet for chart formatting -->
+	<script src="./lib/caHelperFunctions.js"></script> <!-- This is a library I built with some handy functions -->
+	<script src="./lib/jquery/jquery-1.11.1.min.js"></script> <!-- I need JQuery -->
+	<script src="./lib/d3/d3.min.js"></script> <!-- Let's get D3 in here, come on down D3! -->
+	<script src="./lib/nvd3/nv.d3.js"></script> <!-- Let's load NVD3 -->
+	<script src="./lib/spin.js"></script> <!-- Here's something to amuse the users while it's loading -->
+</head>
+
+<body>	<!-- This is the stuff the user will actually see -->
+	<row> <!-- Bill said layouts are easy using tables, rows, and columns -->
+		<div id="barChart" style="height: 290px;"> <!-- This is the HTML div for the chart. Notice the height -->
+			<svg></svg> <!-- This is the placeholder for the SVG that will be the chart -->
+		</div>
+	</row>
+
+<script> // Here's where the cool JavaScript magic happens. Buckle up!
+
+	// Object to hold final results set that gets passed directly into the
+	// NVD3 barchart model. Don't worry about this now, you'll see
+	var finalData = [{key: "Over 75%", values: [] },
+					{key: "Over 50%",  values: [] },
+					{key: "Over 25%",  values: [] },
+					{key: "Under 25%", values: [] }];
+
+	// Use JQuery to determine when document loads so we can ensure all resources required
+	// have been loaded. Let's get going!
+	$(document).ready(function () {
+
+		// Going to create my "page loading" spinner once I know the page has loaded
+		var spinTarget = document.getElementById('barChart');
+		var spinner = new Spinner({color:'#000000', lines: 12}).spin(spinTarget);
+
+		// Get Parameters from CAPC Browser view URL passed
+		// Some of these are {parameters}  (eg. {TimeStartUTC} or {itemIDDa}) 
+		// while others are just user defined strings to match OpenAPI query parameter and entities. 
+		// Things like the OpenAPI metric name or the base query entity (eg. devices).
+		var testMode=getQueryVariable("test"); // Puts the App in "demo" mode
+		var id=getQueryVariable("id") // id={itemIdDa}
+		var startTime=getQueryVariable("startTime"); // startTime={TimeStartUTC}
+		var endTime=getQueryVariable("endTime"); // endTime={TimeEndUTC}
+		var base=getQueryVariable("base"); // Base entity of the OpenAPI query - eg. odata/api/devices?
+		var metric=getQueryVariable("metric"); // OpenAPI metric name I want to report against - eg. im_Utilization
+		var metricFamily=getQueryVariable("metricFamily") // OpenAPI metric-family name for the metric - eg. cpumfs
+
+		// TO DO: Add logic to make sure either the test parameter was specified for demo-mode or
+		// all of the other attributes the OpenAPI query requires have been passed to the App
+		// from the CAPC browser view URL 
+		// ---------- WIP -----------
+		var someDayValidateArgs='maybe'; // Probably wont be a variable but just a placeholder
+
+		// Determine data resolution to request in OpenAPI query based on the 
+		// duration of time selected by the user. As defined this App will get
+		// up to 7 days or raw (as-polled) data and anything longer will
+		// get hourly resolution
+		var resolution;
+		if (endTime - startTime > 604800) { 
+			resolution="HOUR"; resolutionNumber=3600;
+		}
+		else { 
+			resolution="RATE";resolutionNumber=300
+		};
+
+		// We need to fetch the correct amount of rows based on the time-range and
+		// the computed resolution to pass into the OpenAPI "top" parameter which 
+		// specifies the maximum number of rows for each entity
+		var rows=(endTime - startTime) / resolutionNumber; 
+		var url;
+
+
+		// Determine URL or data set to load
+		// If test mode, we load the local data file and pre-define key strings
+		// used in the parsing and output
+		if (testMode) {
+			url="./deviceCPU.csv";
+			metricFamily="cpumfs";
+			metric="im_Utilization";
+			niceMetric=metric.split(/(?=[A-Z])/).join(" ");
+			niceMetricName=niceMetric.substring(niceMetric.indexOf('_')+1);
+		}
+		// Otherwise I'll create the OData URL call by subsituting key browser view parameters
+		// with key query entities and attributes.
+		else {
+		// This builds a dynamic data set driven by the CAPC browser view
+			url="/pc/odata/api/" + base + "?" +
+				"&$filter=(groups/ID eq " + id + ")" +
+				"&$expand=" + metricFamily + 
+				"&$select=ID,Name," + metricFamily + "/" + metric +
+				"&starttime=" + startTime + "&endtime=" + endTime + "&resolution=" + resolution +
+				"&$top=25&top=" + rows +
+				"&$format=text/csv";
+			// For debug purposes, print the URL to the web console so we can run manually or verify if query syntax
+			// is incorrect
+			console.log("URL: " + url);
+		}
+
+		// Load data set using D3.js' csv function which will handle all of the AJAX processing
+		// and will return me a nice structured JSON data set automaticaly that will make 
+		// post processing very easy
+		d3.csv(url,function(error, data) {
+			if (error) {
+			// Stop the music - or the page loading spinner in our case as there aint no more
+			// waitin' to do! 
+				spinner.stop();
+
+			// Alert the user to the error message and we're pretty much done here
+			// This is usually an XMLHttpRequest error due to the same origin security policy
+			// This means the server I am calling the API from needs to be the host of the API
+			// or a proxy to the API. You can also enable CORS but that's a server side operation
+				alert("Error loading data set: " + error)
+			}
+			// No errors and the data set returned by the API - this can mean it's still
+			// empty though. Just sucessfully empty. 
+			else {
+			// Call the function to parse the data, build the buckets and build the data structure in the way
+			// the NVD3 chart likes it
+				parseData(data); 
+			}
+		});
+
+	// This is the function that will do the vast majority of the heavy lifting and processing of the app.
+	// 	1. take the loaded OpenAPI data set
+	//	2. Bucketize the values into the various severity ranges (the stacked aspect of the bar chart)
+	//	3. Convert into the format the NVD3 bar-chart model expects. 
+	//	4. Call the function to build and display the chart
+	function parseData(thisData) {
+		// This is a cool part thanks to D3's data-structure parsing ninja skills
+		// I'm creating a new array of objects each representing a device and a count of the # of 
+		// data points in each severity bucket
+		var utilizationByDevice = d3.nest()
+			// I'm going to collapse all of the rows related to each device into an entry in the dataset 
+			// for each unique device (based off of Name - this could also be ID but I don't think duplicate
+			// names are an issue. ) Ehh, who knows...
+			// This is pretty cool :)
+			.key(function(device) { return device.Name; })
+			// The magic trick's not over yet, now I'm going to creat a key called values (done automatically
+			// by the .rollup function) That key will have an onject of key value pairs to store interesting
+			// statistics about each items data-set as well as the count of data points which fall into each
+			// severity bucket
+			.rollup(function(leaves) { 
+			// I just created the 'values' key and it's entries will be key:value pairs for
+			// each bucket for the item's data-set
+			// I might be able to do this using the D3 histogram model but this way is
+			// straight-forward enough
+				return {
+					total: leaves.length,
+					mean: d3.mean(leaves, function(d) { return Number(d[metricFamily + "/" + metric]); }),
+					min: d3.min(leaves, function(d) { return Number(d[metricFamily + "/" + metric]); }),
+					max: d3.max(leaves, function(d) { return Number(d[metricFamily + "/" + metric]); }),
+					range1: d3.sum(leaves, function (d) { if (d[metricFamily + "/" + metric] >= 75 ) { 
+						return 1} 
+					}),
+					range2: d3.sum(leaves, function (d) { if ( (d[metricFamily + "/" + metric] < 75)  
+															&& (d[metricFamily + "/" + metric] >= 50)) { 
+						return 1} 
+					}),
+					range3: d3.sum(leaves, function (d) { if ( (d[metricFamily + "/" + metric] < 50) 
+															&&  (d[metricFamily + "/" + metric] >= 25)) {
+						return 1} 
+					}),
+					range4: d3.sum(leaves, function (d) { if ( d[metricFamily + "/" + metric] < 25) { 
+						return 1} 
+					}),
+				}
+			}) // end of .rollup function
+
+			// Now that I know what I'm going to do with the data, now I'll pass
+			// the data-set into D3's super-awesome functions for processing 
+			.entries(thisData);
+
+		// Whew! That was sweet! Now I have a really simple data structure that contains only the data I actually
+		// need for the visualization. This will make it much easier to manipulate
+		// Did I say manipulate? Yep! It's time to convert the data-structure into what the NVD3
+		// bar-chart model expects. 
+		// I start by iterating each entry in the data-set I created to each x-axis entry in the chart and 
+		// it's bar sections and values
+		utilizationByDevice.forEach(function (d) {
+			// Now I'll build the buckets to display which will represent the % of samples that fell within
+			// each of the severity ranges I defined in my final data-set object (way up at the top!)
+			// NVD3 wants me to pass in an array of objects which represent the X, Y, and Series aspect of the
+			// stacked bar-chart. X-axis will be each item, Y-Axis will be the total # of samples - 100% is
+			// what I want as each bucket will represent a % of that 100%
+			finalData[0].values.push({
+				// The x-axis value will be each item returned by the OpenAPI query (the original entity eg. devices)
+				// Y value is % of total data points within this bucket - over 75% in this example
+				'x': d.key, 'y': (d.values.range1 / d.values.total) * 100
+				})
+			// And now process the next severity range (50-75%)
+			finalData[1].values.push({
+				'x': d.key, 'y': (d.values.range2 / d.values.total) * 100
+				})
+			// Yadda yadda yadda 
+			finalData[2].values.push({
+				'x': d.key, 'y': (d.values.range3 / d.values.total) * 100
+				})
+			// And the final bucket
+			finalData[3].values.push({
+				'x': d.key, 'y': (d.values.range4 / d.values.total) * 100
+				})
+		}) // end utilizationByDevice function
+
+		// Next bit-o-magic is to simply call the NVD3 charting function to
+		// created my staked bar chart using the data set I just built to display my 
+		// stacked bar-chart components (x,y,series)
+		// I'll also specify attributes of the chart like; formatting, axis & precision,
+		// labels, etc.
+		nv.addGraph(function() {
+			// Stop the music - or the page loading spinner in our case as there aint no more
+			// waitin' ! 
+			spinner.stop();
+
+			// The data's been loaded and processed and now it's time to give the
+			// user what they came here for ... The Chart!
+			// I'll define all of the attributes of my chart based on what
+			// NVd3 exposes in the API for the multiBarChart model
+			var chart = nv.models.multiBarChart() // The NVD3 model name
+				.transitionDuration(50) 	// The speed of the animation 
+				.reduceXTicks(false)   		// If 'false', every single x-axis tick label will be rendered.
+				.rotateLabels(-45) 			//Angle to rotate x-axis labels.
+				.margin({top: 50, right: 50, bottom: 150, left: 80})
+				.stacked(true)				// This is a stacked bar chart
+				.showControls(true)  		//Allow user to switch between 'Grouped' and 'Stacked' mode.
+				.groupSpacing(.4)    		//Distance between each group of bars.
+				// These attributes I have to pass to the chart model instantiation based on how the 
+				// NVD3 model API works. Not sure why and I might be able to unify this a bit
+				// more in the future
+				chart.color(["#d62626","#F38C31","#FDF46D","#62bc51"]) // Colors for each severity bucket (0-3)
+				chart.options({forceY: [0,100]}) // I want the Y-Axis to always show 1-100 rather than auto-scaling 
+				chart.height(300)				// The .... height
+				chart.yAxis.tickFormat(d3.format(',.1f'));	// This sets the precision of my Y-axis values
+				chart.yAxis.axisLabel('% of time ' + metric + ' in range'); // The Y-Axis label
+				chart.tooltips(true)			// Tool-tips are nice, let's show them!
+				chart.tooltipContent(function(key, y, e, graph) { // Here's what's in my tooltip
+					// This is just copy and paste from their examples
+					var data =graph.series.values[y-1];
+					// Here's where I specify the contents of the tooltip based on HTML
+					// syntax
+					return  '<p> <h3>' + y +'</h3></p>' +
+							'<p>' +  e + '% of samples were ' + key + ' Utilization';
+					}); // end of tooltipContent function
+
+			/// Once again we've been telling NVD3 (and D3) what we want to build, what the data will be
+			// and how we'll represent that data. Now I simply need to tell NVD3 (D3) to get 'er done!
+ 			d3.select('#barChart svg')
+	 			// Sounds fancy! This is just the call to specify the data set to apply to this model
+	 			// Hey that's the data-set we processed 50 or so lines ago!
+				.datum(finalData)
+				// Now that the data is bound to the nmodel.
+				// I call NVD3 (D3) to draw the graph (create the SVG components)
+				// in the browser window
+				.call(chart);
+
+			// A simple call to have NVD3 (D3) auto-resize my chart when the user makes the browser window
+			// bigger or smaller. This also auto-scales the chart to fit within the browser view in most of the 
+			// CAPC Dashboard layouts
+			nv.utils.windowResize(chart.update);
+			// This passes the chart object back - for error checking and what not I assume. I'm not 100%
+			// sure what this actually does - other than the obvious but it's what they have in their examples
+			// so ...
+			return chart;
+		}); // End the nv.addGraph function
+
+	}; // End of the parseData function
+
+}); // End of the JQuery on document ready function. Nothing else to see ... Fin 
+
+</script>
+</body>
+</html>
+
+
